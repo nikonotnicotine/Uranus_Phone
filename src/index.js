@@ -179,6 +179,24 @@ export class Uranus extends DurableObject {
     if (this.kv.get("origin") !== url.origin) this.kv.put("origin", url.origin);
     await this.boot();
 
+    /*
+     * 判闸之前先把路径规范化。**不规范化就等于没有闸** —— 底下跑的是 express，
+     * 而 express 4 默认大小写不敏感路由（这个仓库没设 case sensitive routing），
+     * 所以 `/API/config` 照样会被路由到 `/api/config` 的处理函数；而这里拿
+     * `url.pathname` 原样比，`/API/config` 不以 `/api/` 开头，x-uranus-pass
+     * 那道闸直接跳过。桌面版内层那道闸原来犯的是同一个错（见
+     * core/server/src/index.js 里 OPEN_PATHS 下面那段），于是大小写一改，
+     * 外层控制台登录和内层会话鉴权**两道一起废**，不带任何凭据就能读到
+     * `GET /api/config` —— 那里面是 loadConfig() 原样，各家密钥都在。
+     *
+     * 尾部斜杠一并去掉：express 默认也不认 strict routing，`/api/health/`
+     * 同样命中 `/api/health`，但原样比的话它不等于 `/api/health`，于是
+     * 本该免登录的那条反而被挡（方向是安全的，但一样是 bug）。
+     *
+     * `/hook` 不走这个 —— 那是 Photon 按固定 URL 推过来的，照原样比就行。
+     */
+    const pathname = url.pathname.toLowerCase().replace(/\/$/, "");
+
     if (url.pathname === "/hook") {
       if (req.method !== "POST") return new Response("ok");
       const body = new Uint8Array(await req.arrayBuffer());
@@ -192,7 +210,7 @@ export class Uranus extends DurableObject {
 
     if (req.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), req);
 
-    if (url.pathname.startsWith("/api/") && url.pathname !== "/api/health") {
+    if ((pathname === "/api" || pathname.startsWith("/api/")) && pathname !== "/api/health") {
       if (!(await verifyPass(req.headers.get("x-uranus-pass")))) {
         return withCors(
           Response.json(
@@ -204,7 +222,7 @@ export class Uranus extends DurableObject {
       }
     }
 
-    if (url.pathname === "/api/auth/login" && this.auth.mustChangeCredentials()) {
+    if (pathname === "/api/auth/login" && this.auth.mustChangeCredentials()) {
       return withCors(
         Response.json(
           {
@@ -234,7 +252,7 @@ export class Uranus extends DurableObject {
     } else if (bearer) headers.set("cookie", `${COOKIE}=${encodeURIComponent(bearer)}`);
 
     // 云备份（从云盘整包拉取）没做：那条路会先把包存一份在云盘上，小手机这边不管云盘
-    if (req.method === "POST" && RESTORE_PATHS.has(url.pathname)) {
+    if (req.method === "POST" && RESTORE_PATHS.has(pathname)) {
       return withCors(
         Response.json(
           {
