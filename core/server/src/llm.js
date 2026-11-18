@@ -28,6 +28,7 @@ import {
   anthropicHeaders,
   anthropicRoot,
   apiType,
+  assertKeyIsNotServiceAccount,
   chatRequest,
   geminiHeaders,
   geminiModelUrl,
@@ -35,6 +36,14 @@ import {
   isOfficialGemini,
   nativeResult,
 } from "./apitype.js";
+import {
+  VERTEX_PUBLISHERS,
+  isVertexClaude,
+  readVertexModelPage,
+  vertexAuth,
+  vertexListUrl,
+  vertexModelUrl,
+} from "./vertex.js";
 
 const REQUEST_TIMEOUT = 60000;
 const TEST_TIMEOUT = 30000;
@@ -319,6 +328,18 @@ const FAULT_ADVICE = {
 function faultKind(err, kind) {
   err.faultKind = kind;
   return err;
+}
+
+/**
+ * 服务账号 JSON 粘到了别的类型上。实现在 apitype.js（media.js 的生图那条
+ * 也用它），这里只把它抛的错盖上 `config` 归属，好让四个调用点照旧只写一行。
+ */
+function assertKeyShape(type, key, label) {
+  try {
+    assertKeyIsNotServiceAccount(type, key, label);
+  } catch (e) {
+    throw faultKind(e, "config");
+  }
 }
 
 /**
@@ -970,6 +991,8 @@ async function chatRaw(endpoint, messages, opts = {}) {
       "config"
     );
   }
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyShape(type, key, label);
 
   // Gemini 3.7 / 3.8 的两条硬规矩，见 GEMINI_STRICT
   const strict = GEMINI_STRICT.test(model);
@@ -1085,8 +1108,19 @@ async function chatRaw(endpoint, messages, opts = {}) {
     // 每圈开头看一眼：等重试的那几秒里用户可能已经按停了
     if (opts.signal?.aborted) throw abortedError();
     const retryIn = delays[attempt];
-    // 每圈重新翻译：上一圈可能刚脱掉一个参数、换了一句说法
-    const wire = chatRequest(type, base, key, body, streaming);
+    /*
+     * 每圈重新翻译：上一圈可能刚脱掉一个参数、换了一句说法。
+     *
+     * Vertex 那条要 await 换 access token（缓存命中就不打网络，见 vertex.js）。
+     * 它抛的「密钥填得不对」盖上 config —— 那是 Uranus 侧的配置问题，不是上游
+     * 的错，别让用户拿着它去问 Google 客服；换 token 没连上的盖 network。
+     */
+    let wire;
+    try {
+      wire = await chatRequest(type, base, key, body, streaming);
+    } catch (e) {
+      throw faultKind(e, e?.configFault ? "config" : e?.networkFault ? "network" : "upstream");
+    }
     try {
       /*
        * 流式和非流式走两个函数，但**返回同一个形状** —— 下面整段重试、脱参数、
@@ -1113,8 +1147,9 @@ async function chatRaw(endpoint, messages, opts = {}) {
             timeout: opts.timeout ?? REQUEST_TIMEOUT,
             signal: opts.signal,
           });
-      // 原生接口的响应翻回 choices[0].message.content，下面一行都不用改
-      if (wire.native) result = nativeResult(type, result);
+      // 原生接口的响应翻回 choices[0].message.content，下面一行都不用改。
+      // 按 wire.shape 而不是 type —— Vertex 一个类型下有 Gemini / Claude 两种形状
+      if (wire.native) result = nativeResult(wire.shape ?? type, result);
     } catch (e) {
       /*
        * 按停要在 isTransient 之前判掉。
@@ -1512,6 +1547,9 @@ export async function testEndpoint(endpoint, label = "API") {
  * Gemini / Claude 类型打各自的原生列表：Gemini 回 `{models:[{name:"models/xxx"}]}`
  * （前缀要剥掉），Claude 回 `{data:[{id}]}`，下面那段解析两种都认得。
  *
+ * Vertex 自己一条（`publishers.models.list`，两家 publisher 合并），在下面那个
+ * 分支里就地返回，不走后面这套解析 —— 它的响应是 `{publisherModels:[…]}`。
+ *
  * @returns {Promise<{ok:boolean, models?:string[], error?:string}>}
  */
 export async function listModels(endpoint, label = "API") {
@@ -1525,6 +1563,94 @@ export async function listModels(endpoint, label = "API") {
   if (type === "novelai") {
     logInfo(label, `NovelAI 没有模型列表接口，给的是内置清单（${NOVELAI_MODELS.length} 个）`);
     return { ok: true, models: [...NOVELAI_MODELS] };
+  }
+  /*
+   * Vertex 同理。它的 Model Garden 列表要另外的权限和另一条 API，回的还是一大堆
+   * 跟生成无关的条目 —— 不如直接给常用的那些，别的用「自定义模型」手填。
+   */
+  /*
+   * Vertex：`publishers.models.list`，两家 publisher 各问一遍。
+   *
+   * 以前这儿给的是一份写死的清单，理由写的是「Vertex 没有列模型的接口」——
+   * 那个结论是错的，`v1beta1` 上有 `publishers.models.list`。而写死的清单必然
+   * 过期：它停在 gemini-2.5 那一代，而用户的项目里早就有更新的型号了，照着
+   * 那份清单配等于被按在老模型上。
+   *
+   * google 和 anthropic 分开问，而且**一家失败不算整次失败** —— 绝大多数项目
+   * 压根没在 Model Garden 里开 Claude，那边回 403 是常态，不该因此让用户连
+   * Gemini 的列表也看不到。
+   */
+  if (type === "vertex") {
+    let auth;
+    try {
+      auth = await vertexAuth(base, key);
+    } catch (e) {
+      const error = `${label} ${String(e?.message ?? e)}`;
+      logWarn(label, "获取模型列表失败", error);
+      return { ok: false, error };
+    }
+
+    const found = [];
+    const failures = [];
+    for (const publisher of VERTEX_PUBLISHERS) {
+      let pageToken = "";
+      // 翻页有上限：一个 publisher 翻十页还没完，多半是对面在打环
+      for (let page = 0; page < 10; page += 1) {
+        const url = vertexListUrl({
+          root: auth.root,
+          project: auth.project,
+          region: auth.region,
+          publisher,
+          pageToken,
+        });
+        let r;
+        try {
+          r = await requestJson(url, {
+            method: "GET",
+            headers: auth.headers,
+            timeout: TEST_TIMEOUT,
+          });
+        } catch (e) {
+          failures.push(`${publisher}：${describeNetworkError(e, TEST_TIMEOUT)}`);
+          break;
+        }
+        if (!r.ok) {
+          failures.push(`${publisher}：${describeUpstream(r.status, r.text, r.data)}`);
+          break;
+        }
+        const { names, next } = readVertexModelPage(r.data);
+        found.push(...names);
+        if (!next) break;
+        pageToken = next;
+      }
+    }
+
+    if (found.length) {
+      if (failures.length) {
+        logWarn(label, "有一家 publisher 没拉到，已跳过", failures.join("\n"));
+      }
+      const models = Array.from(new Set(found)).sort((a, b) => a.localeCompare(b));
+      logInfo(label, `拉到 ${models.length} 个模型`);
+      return { ok: true, models };
+    }
+
+    const error =
+      `${label} 拉模型失败：${failures.join("；") || "列表是空的"}。` +
+      `这条接口要 aiplatform.models.list 权限（roles/aiplatform.user 就带着）；` +
+      `拉不到也不影响用 —— 用「自定义模型」手填模型名照样能打`;
+    logWarn(label, "获取模型列表失败", error);
+    return { ok: false, error };
+  }
+  /*
+   * 服务账号 JSON 粘到了别的类型上。这个函数不抛错（前端直接渲染返回值），
+   * 所以把那句话转成 error 字段 —— 要紧的是它不带密钥。
+   */
+  try {
+    assertKeyShape(type, key, label);
+  } catch (e) {
+    const error = String(e?.message ?? e);
+    logWarn(label, "获取模型列表失败", error);
+    return { ok: false, error };
   }
   const target =
     type === "gemini"
@@ -1784,8 +1910,9 @@ async function inlineMedia(endpoint, prompt, media, kind) {
       "config"
     );
   }
-  // Claude 压根不收音频和视频，打过去只会白花一次钱再 400
-  if (type === "anthropic") {
+  // Claude 压根不收音频和视频，打过去只会白花一次钱再 400。
+  // Vertex 上托管的那些同理 —— 换的是入口，不是模型的本事
+  if (type === "anthropic" || (type === "vertex" && isVertexClaude(model))) {
     throw faultKind(
       new Error(`${label} 选的是 Claude 的模型，Claude 不收${kind.noun}，换一个 Gemini 或自定义类型的服务商源`),
       "config"
@@ -1794,8 +1921,44 @@ async function inlineMedia(endpoint, prompt, media, kind) {
 
   const usePrompt = String(prompt ?? "").trim() || kind.defaultPrompt;
   const mimeType = media.mimeType || kind.fallbackMime;
-  // 自定义 / OpenAI 类型照旧：同一个域名拼原生路径（中转站就是这么通的）
-  const url = type === "gemini" ? geminiModelUrl(base, model, "generateContent") : geminiNativeUrl(base, model);
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyShape(type, key, label);
+
+  /*
+   * 打到哪、带什么头。
+   *
+   * Vertex 的路径和鉴权都是自己一套（服务账号要换 access token），所以单开一条；
+   * 它和 gemini 一样是直连官方，安全过滤要自己关。
+   * 自定义 / OpenAI 类型照旧：同一个域名拼原生路径（中转站就是这么通的）。
+   */
+  let url;
+  let headers;
+  let nativeGoogle = type === "gemini";
+  if (type === "vertex") {
+    let auth;
+    try {
+      auth = await vertexAuth(base, key);
+    } catch (e) {
+      throw faultKind(e, e?.configFault ? "config" : e?.networkFault ? "network" : "upstream");
+    }
+    url = vertexModelUrl({
+      root: auth.root,
+      project: auth.project,
+      region: auth.region,
+      model,
+      method: "generateContent",
+    });
+    headers = auth.headers;
+    nativeGoogle = true;
+  } else {
+    url = type === "gemini" ? geminiModelUrl(base, model, "generateContent") : geminiNativeUrl(base, model);
+    headers =
+      type === "gemini"
+        ? geminiHeaders(base, key)
+        : isOfficialGemini(base)
+        ? { "Content-Type": "application/json", "x-goog-api-key": key }
+        : { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
+  }
 
   /*
    * parts 的顺序：媒体在前、提示词在后。
@@ -1814,15 +1977,8 @@ async function inlineMedia(endpoint, prompt, media, kind) {
       },
     ],
     // 直连官方要自己关安全过滤（中转站替你关了），见 apitype.js
-    ...(type === "gemini" ? { safetySettings: GEMINI_SAFETY_OFF } : {}),
+    ...(nativeGoogle ? { safetySettings: GEMINI_SAFETY_OFF } : {}),
   };
-
-  const headers =
-    type === "gemini"
-      ? geminiHeaders(base, key)
-      : isOfficialGemini(base)
-      ? { "Content-Type": "application/json", "x-goog-api-key": key }
-      : { "Content-Type": "application/json", Authorization: `Bearer ${key}` };
 
   const kb = Math.round((media.base64.length * 3) / 4 / 1024);
   logDebug(
@@ -2038,7 +2194,7 @@ export async function embedText(endpoint, text, opts = {}) {
   if (!input) throw new Error(`${label} 收到空文本`);
 
   const type = apiType(endpoint);
-  if (type === "anthropic" || type === "novelai") {
+  if (type === "anthropic" || type === "novelai" || (type === "vertex" && isVertexClaude(model))) {
     throw faultKind(
       new Error(
         `${label} 选的是 ${type === "novelai" ? "NovelAI" : "Claude"} 的模型，` +
@@ -2047,15 +2203,46 @@ export async function embedText(endpoint, text, opts = {}) {
       "config"
     );
   }
-  // Gemini 原生是 `:embedContent`，请求和响应的形状都和 OpenAI 那个不一样
-  const target =
-    type === "gemini"
-      ? {
-          url: geminiModelUrl(base, model, "embedContent"),
-          headers: geminiHeaders(base, key),
-          body: { content: { parts: [{ text: input }] } },
-        }
-      : { url: `${base}/embeddings`, body: { model, input } };
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyShape(type, key, label);
+  /*
+   * 三家三个形状：
+   *   OpenAI 兼容  POST {根}/embeddings          `{model, input}`  → data[0].embedding
+   *   Gemini 原生  …/models/{模型}:embedContent  `{content:{parts}}` → embedding.values
+   *   Vertex       …/models/{模型}:predict       `{instances:[{content}]}`
+   *                                             → predictions[0].embeddings.values
+   *
+   * Vertex 那条是 GCP 自己那套 predict 接口，和 AI Studio 的 `:embedContent`
+   * 既不同路径也不同形状，所以单开一条，不能拿 gemini 那条凑。
+   */
+  let target;
+  if (type === "vertex") {
+    let auth;
+    try {
+      auth = await vertexAuth(base, key);
+    } catch (e) {
+      throw faultKind(e, e?.configFault ? "config" : e?.networkFault ? "network" : "upstream");
+    }
+    target = {
+      url: vertexModelUrl({
+        root: auth.root,
+        project: auth.project,
+        region: auth.region,
+        model,
+        method: "predict",
+      }),
+      headers: auth.headers,
+      body: { instances: [{ content: input }] },
+    };
+  } else if (type === "gemini") {
+    target = {
+      url: geminiModelUrl(base, model, "embedContent"),
+      headers: geminiHeaders(base, key),
+      body: { content: { parts: [{ text: input }] } },
+    };
+  } else {
+    target = { url: `${base}/embeddings`, body: { model, input } };
+  }
 
   const delays = RETRY_DELAYS.slice(0, opts.retries ?? 1);
 
@@ -2092,9 +2279,18 @@ export async function embedText(endpoint, text, opts = {}) {
   }
 
   const vector =
-    type === "gemini" ? result.data?.embedding?.values : result.data?.data?.[0]?.embedding;
+    type === "vertex"
+      ? result.data?.predictions?.[0]?.embeddings?.values
+      : type === "gemini"
+      ? result.data?.embedding?.values
+      : result.data?.data?.[0]?.embedding;
   if (!Array.isArray(vector) || !vector.length) {
-    const need = type === "gemini" ? "embedding.values" : "data[0].embedding";
+    const need =
+      type === "vertex"
+        ? "predictions[0].embeddings.values"
+        : type === "gemini"
+        ? "embedding.values"
+        : "data[0].embedding";
     throw new Error(`${label} 返回格式看不懂（缺 ${need}）：${result.text.slice(0, 300)}`);
   }
   // 有的中转站会把数字发成字符串，这里统一成 number —— 余弦那边要算术运算
